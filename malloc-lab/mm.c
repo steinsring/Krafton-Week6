@@ -296,7 +296,7 @@ static char* coalesce(void *bp)
         bp = PREV_BLKP(bp);
     }
 
-    classify_block(bp, size);
+    //classify_block(bp, size);
 
     return bp;
 }
@@ -371,18 +371,18 @@ static void classify_block(void * bp, size_t size)
             return;
         }
 
-        // 헤드보다 bp의 크기가 클때
-        if (GET_SIZE(HDRP(large_bin_head)) < size)
+        // 헤드보다 bp의 크기가 작을때
+        if (GET_SIZE(HDRP(large_bin_head)) > size)
         {
             arena.large_bin[i] = bp;
             insert_head(large_bin_head, bp);
             return;
         }
 
-        // 내림차순 정렬
+        // 오름차순 정렬
         char *cur = GET_PTR(NEXT_FREE_PTR(large_bin_head));
         char *prev = large_bin_head;
-        while(cur != NULL && GET_SIZE(HDRP(cur)) > size)
+        while(cur != NULL && GET_SIZE(HDRP(cur)) < size)
         {
             prev = cur;
             cur = GET_PTR(NEXT_FREE_PTR(cur));
@@ -437,8 +437,7 @@ static void *find_fit(size_t asize)
     while(cur != NULL && asize > GET_SIZE(HDRP(cur)))
     {// 적절하지 못하면 즉시 small, large로 분류
         del_from_bin(cur, GET_SIZE(HDRP(cur)));
-        // 병합
-        coalesce(cur);
+        classify_block(cur, GET_SIZE(HDRP(cur)));
         cur = arena.unsorted_bin;
     }
 
@@ -455,47 +454,39 @@ static void *find_fit(size_t asize)
     arena.unsorted_bin = NULL;
 
     // small bin에서 찾기
-    if (asize <= MAX_SMALL_BIN)
+    size_t s_i = (size_t)(asize / SMALL_BIN_UNIT);
+    for (; s_i < SMALL_BIN_LENGTH; s_i++)
     {
-        size_t i = (size_t)(asize / SMALL_BIN_UNIT);
-        for (; i < SMALL_BIN_LENGTH; i++)
+        if (arena.small_bin[s_i] != NULL)
         {
-            if (arena.small_bin[i] != NULL)
+            char * p = arena.small_bin[s_i];
+            char * new_head = GET_PTR(NEXT_FREE_PTR(p));
+            if (new_head != NULL)
             {
-                char * p = arena.small_bin[i];
-                char * new_head = GET_PTR(NEXT_FREE_PTR(p));
-                if (new_head != NULL)
-                {
-                    PUT_PTR(PREV_FREE_PTR(new_head), NULL);
-                }
-                arena.small_bin[i] = new_head;
-                return p;
+                PUT_PTR(PREV_FREE_PTR(new_head), NULL);
             }
+            arena.small_bin[s_i] = new_head;
+            return p;
         }
     }
     // large bin에서 찾기
-    else
+    size_t i = (size_t)(asize / LARGE_BIN_UNIT) - 1;
+    if (i >= LARGE_BIN_LENGTH) i = LARGE_BIN_LENGTH - 1;
+
+    for (; i < LARGE_BIN_LENGTH; i++)
     {
-        size_t i = (size_t)(asize / LARGE_BIN_UNIT) - 1;
-        if (i >= LARGE_BIN_LENGTH) i = LARGE_BIN_LENGTH - 1;
-
-        for (; i < LARGE_BIN_LENGTH; i++)
+        char *cur = arena.large_bin[i];
+        while (cur != NULL && asize > GET_SIZE(HDRP(cur)))
         {
-            char *large_bin_head = arena.large_bin[i];
-            if (large_bin_head != NULL && asize <= GET_SIZE(HDRP(large_bin_head)))
-            {
-                char * new_head = GET_PTR(NEXT_FREE_PTR(large_bin_head));
-                if (new_head != NULL)
-                {
-                    PUT_PTR(PREV_FREE_PTR(new_head), NULL);
-                }
-                arena.large_bin[i] = new_head;
-                return large_bin_head;
-            }
+            cur = GET_PTR(NEXT_FREE_PTR(cur));
         }
+
+        if (cur == NULL)    continue;
+
+        del_from_bin(cur, GET_SIZE(HDRP(cur)));
+        return cur;
     }
-
-
+    
     // 찾지 못한 경우
     return NULL;
 }
@@ -524,7 +515,8 @@ static void place(void *bp, size_t asize)
     PUT(FTRP(NEXT_BLKP(bp)), PACK(size - asize, 0));    // size < asize가 큰 경우 죽어버림
 
     // 분할하고 남은거 정리
-    coalesce(NEXT_BLKP(bp));
+    char *merged = coalesce(NEXT_BLKP(bp));
+    classify_block(NEXT_BLKP(bp), GET_SIZE(HDRP(NEXT_BLKP(bp))));
     return;
 }
 
@@ -539,11 +531,11 @@ void mm_free(void *bp)
     PUT(FTRP(bp), PACK(size, 0));
 
     // unsoretd bin에 넣기
+    char *merged = coalesce(bp);
     char *unsorted_head = arena.unsorted_bin;
 
-    insert_head(unsorted_head, bp);
-    arena.unsorted_bin = bp;
-
+    insert_head(unsorted_head, merged);
+    arena.unsorted_bin = merged;
 }
 
 /*
