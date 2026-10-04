@@ -542,9 +542,71 @@ void mm_free(void *bp)
  */
 void *mm_realloc(void *ptr, size_t size)
 {
+    // 요청한 크기보다 이미 가지고 있는 크기가 더 크면 분할 후 리턴
+    if (!ptr)
+    {
+        mm_malloc(size);
+    }
+
+    if (size == 0)  
+    {
+        mm_free(ptr);
+        return NULL;    // 요청 크기가 0
+    }
+
+    size_t old_size = GET_SIZE(HDRP(ptr));
+    size_t asize;                   // 정렬에 맞춰진 크기
+
+    if (size <= 2 * DSIZE)  asize = 3 * DSIZE;  // 최소 크기(24) 할당
+    else  asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);   // 헤더와 푸터를 더하고 DSIZE 배수로
+
+    if (old_size >= asize)
+    {
+        place(ptr, asize);
+        return ptr;
+    }
+
+    // 블록을 확장해야할 경우
+
+    // 1. 제자리 확장 (오른쪽 블록 병합)
+    size_t next_block_size = GET_SIZE(HDRP(NEXT_BLKP(ptr)));
+    if (!GET_ALLOC(HDRP(NEXT_BLKP(ptr))) && (old_size + next_block_size >= asize))
+    {
+        // 이제 사용할 블록
+        del_from_bin(NEXT_BLKP(ptr), next_block_size);
+        
+        // 적절히 잘라서 병합하고 남은건 분류
+        size_t total_size = old_size + next_block_size;
+        size_t remain_size = total_size - asize;
+        // 최소 크기보다 작게 남으면 다 주기
+        if (remain_size < 3 * DSIZE )
+        {
+            PUT(HDRP(ptr), PACK(total_size, 1));
+            PUT(FTRP(ptr), PACK(total_size, 1));
+            return ptr;
+        }
+
+        // 아니면 쓸만큼 쓰고 분할해서 분류
+        PUT(HDRP(ptr), PACK(asize, 1));
+        PUT(FTRP(ptr), PACK(asize, 1));
+
+        PUT(HDRP(NEXT_BLKP(ptr)), PACK(remain_size, 0));
+        PUT(FTRP(NEXT_BLKP(ptr)), PACK(remain_size, 0));
+
+        classify_block(NEXT_BLKP(ptr), remain_size);
+        return ptr;
+    }
+
+    // 2. 적절한 블록이 있는지 탐색후 위치 옮기기
+
+    // 3. 적절한 블록이 없으면 확장 후 할당
+
+
+
     void *oldptr = ptr;
     void *newptr;
     size_t copySize;
+
 
     newptr = mm_malloc(size);
     if (newptr == NULL)
