@@ -73,7 +73,7 @@ static char *heap_listp = 0;        // allocator가 관리하는 첫 블록을 �
 #define SMALL_BIN_LENGTH    129
 #define SMALL_BIN_UNIT      8
 
-#define LARGE_BIN_UNIT      1024
+#define LARGE_BIN_UNIT(i)   ((128ULL) * (1ULL << (i)))
 #define LARGE_BIN_LENGTH    11
 
 #define NEXT_FREE_PTR(bp)   ((char *)(bp))              // 다음 빈 블록 주소의 위치
@@ -353,11 +353,12 @@ static void classify_block(void * bp, size_t size)
     {
         // large bin 범위에 해당하는지 검사
         // large_bin[0] : 1024 ~ 2048
-        // large_bin[1] : 2048 ~ 3096
+        // large_bin[1] : 2048 ~ 3072
+        // large_bin[10] : 
         size_t i = 1;
         for (; i < LARGE_BIN_LENGTH; i++)
         {
-            if(size < LARGE_BIN_UNIT + LARGE_BIN_UNIT * i)  break;
+            if(size < 1024 + LARGE_BIN_UNIT(i))  break;
         }
         i--;
         char *large_bin_head = arena.large_bin[i];
@@ -407,8 +408,8 @@ void *mm_malloc(size_t size)
 
     if (size == 0)  return NULL;    // 요청 크기가 0
 
-    if (size <= DSIZE)  asize = 3 * DSIZE;  // 최소 크기(24) 할당
-    else                asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);   // 헤더와 푸터를 더하고 DSIZE 배수로
+    if (size <= 2 * DSIZE)  asize = 3 * DSIZE;  // 최소 크기(24) 할당
+    else  asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);   // 헤더와 푸터를 더하고 DSIZE 배수로
 
     // asize 이상 크기의 free block을 찾고 할당
     if ((bp = find_fit(asize)) != NULL)
@@ -470,10 +471,8 @@ static void *find_fit(size_t asize)
         }
     }
     // large bin에서 찾기
-    size_t i = (size_t)(asize / LARGE_BIN_UNIT) - 1;
-    if (i >= LARGE_BIN_LENGTH) i = LARGE_BIN_LENGTH - 1;
 
-    for (; i < LARGE_BIN_LENGTH; i++)
+    for (size_t i = 0; i < LARGE_BIN_LENGTH; i++)
     {
         char *cur = arena.large_bin[i];
         while (cur != NULL && asize > GET_SIZE(HDRP(cur)))
