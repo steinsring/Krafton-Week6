@@ -92,6 +92,8 @@ static void insert_linked_list(char *prev, char* cur);
 static void del_linked_list(char *prev, char* cur);
 static void del_from_bin(char *bp, size_t size);
 static char **find_head(char *bp, size_t size);
+static void block_split(char *bp, size_t asize, size_t remain_size);
+static void write_end_of_heap_block(char *bp, size_t asize);
 
 static void print_fragmentation(size_t request_size)
 {
@@ -286,9 +288,7 @@ static void *extend_heap(size_t words)
     // mem_sbrk는 확장하기 전 힙의 끝 주소를 반환한다.
     if ((long)(block_pointer = mem_sbrk(size)) == -1)  return NULL; // 힙 확장 실패시 NULL
 
-    PUT(HDRP(block_pointer), PACK(size, 0));            // 블록의 헤더 작성
-    PUT(FTRP(block_pointer), PACK(size, 0));            // 블록의 푸터 작성
-    PUT(HDRP(NEXT_BLKP(block_pointer)), PACK(0, 1));    // epilogue 주소 헤더 작성
+    write_end_of_heap_block(block_pointer, size);
 
     // 포인터 초기화
     PUT_PTR(PREV_FREE_PTR(block_pointer), NULL);
@@ -622,10 +622,8 @@ static void place(void *bp, size_t asize)
     }
 
     // 24 이상일경우 분할
-    PUT(HDRP(bp), PACK(asize, 1));
-    PUT(FTRP(bp), PACK(asize, 1));
-    PUT(HDRP(NEXT_BLKP(bp)), PACK(size - asize, 0));
-    PUT(FTRP(NEXT_BLKP(bp)), PACK(size - asize, 0));    // size < asize가 큰 경우 죽어버림
+    block_split(bp, asize, size - asize);
+
 
     // 분할하고 남은거 정리
     char *merged = coalesce(NEXT_BLKP(bp));
@@ -720,12 +718,7 @@ void *mm_realloc(void *ptr, size_t size)
             }
 
             // 아니면 쓸만큼 쓰고 분할해서 분류
-            PUT(HDRP(ptr), PACK(asize, 1));
-            PUT(FTRP(ptr), PACK(asize, 1));
-
-            PUT(HDRP(NEXT_BLKP(ptr)), PACK(remain_size, 0));
-            PUT(FTRP(NEXT_BLKP(ptr)), PACK(remain_size, 0));
-
+            block_split(ptr, asize, remain_size);
             classify_block(NEXT_BLKP(ptr), remain_size);
             return ptr;
         }
@@ -755,11 +748,8 @@ void *mm_realloc(void *ptr, size_t size)
 
             // 아니면 쓸만큼 쓰고 분할해서 분류
             memmove(newptr, oldptr, copySize);
-            PUT(HDRP(newptr), PACK(asize, 1));
-            PUT(FTRP(newptr), PACK(asize, 1));
+            block_split(newptr, asize, remain_size);
 
-            PUT(HDRP(NEXT_BLKP(newptr)), PACK(remain_size, 0));
-            PUT(FTRP(NEXT_BLKP(newptr)), PACK(remain_size, 0));
 
             classify_block(NEXT_BLKP(newptr), remain_size);
             return newptr;
@@ -790,12 +780,7 @@ void *mm_realloc(void *ptr, size_t size)
 
             // 아니면 쓸만큼 쓰고 분할해서 분류
             memmove(newptr, oldptr, copySize);
-            PUT(HDRP(newptr), PACK(asize, 1));
-            PUT(FTRP(newptr), PACK(asize, 1));
-
-            PUT(HDRP(NEXT_BLKP(newptr)), PACK(remain_size, 0));
-            PUT(FTRP(NEXT_BLKP(newptr)), PACK(remain_size, 0));
-
+            block_split(newptr, asize, remain_size);
             classify_block(NEXT_BLKP(newptr), remain_size);
             return newptr;
         }
@@ -821,9 +806,7 @@ void *mm_realloc(void *ptr, size_t size)
         // 필요한 payload만큼 요청
         if ((long)(mem_sbrk(asize - old_size)) == -1)  return NULL; // 힙 확장 실패시 NULL
 
-        PUT(HDRP(ptr), PACK(asize, 1));            // 블록의 헤더 작성
-        PUT(FTRP(ptr), PACK(asize, 1));            // 블록의 푸터 작성
-        PUT(HDRP(NEXT_BLKP(ptr)), PACK(0, 1));     // epilogue 주소 헤더 작성
+        write_end_of_heap_block(ptr, asize);
 
         return ptr;
     }
@@ -839,9 +822,7 @@ void *mm_realloc(void *ptr, size_t size)
         del_from_bin(PREV_BLKP(ptr), prev_block_size);
 
         memmove(newptr, oldptr, copySize);
-        PUT(HDRP(newptr), PACK(asize, 1));            // 블록의 헤더 작성
-        PUT(FTRP(newptr), PACK(asize, 1));            // 블록의 푸터 작성
-        PUT(HDRP(NEXT_BLKP(newptr)), PACK(0, 1));     // epilogue 주소 헤더 작성
+        write_end_of_heap_block(newptr, asize);
 
         return newptr;
     }
@@ -854,10 +835,7 @@ void *mm_realloc(void *ptr, size_t size)
         if ((long)(mem_sbrk(asize - (old_size + next_block_size))) == -1)  return NULL; // 힙 확장 실패시 NULL
         
         del_from_bin(NEXT_BLKP(oldptr), next_block_size);
-
-        PUT(HDRP(oldptr), PACK(asize, 1));            // 블록의 헤더 작성
-        PUT(FTRP(oldptr), PACK(asize, 1));            // 블록의 푸터 작성
-        PUT(HDRP(NEXT_BLKP(oldptr)), PACK(0, 1));     // epilogue 주소 헤더 작성
+        write_end_of_heap_block(oldptr, asize);
 
         return oldptr;
     }
@@ -875,3 +853,20 @@ void *mm_realloc(void *ptr, size_t size)
     return newptr;
 }
 
+static void write_end_of_heap_block(char *bp, size_t asize)
+{
+    PUT(HDRP(bp), PACK(asize, 1));            // 블록의 헤더 작성
+    PUT(FTRP(bp), PACK(asize, 1));            // 블록의 푸터 작성
+    PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1));     // epilogue 주소 헤더 작성
+}
+
+static void block_split(char *bp, size_t asize, size_t remain_size)
+{
+    // 사용할 블록
+    PUT(HDRP(bp), PACK(asize, 1));
+    PUT(FTRP(bp), PACK(asize, 1));
+
+    // 남은 블록
+    PUT(HDRP(NEXT_BLKP(bp)), PACK(remain_size, 0));
+    PUT(FTRP(NEXT_BLKP(bp)), PACK(remain_size, 0));
+}
