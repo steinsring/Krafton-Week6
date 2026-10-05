@@ -48,7 +48,7 @@ static char *heap_listp = 0;        // allocator가 관리하는 첫 블록을 �
 
 #define WSIZE           4           // WORD
 #define DSIZE           8           // DOUBLE WORD
-#define CHUNKSIZE       (1<<6)     // 힙 확장시 4096바이트 한번에 확장
+#define CHUNKSIZE       (1<<6)      // 힙 확장시 64바이트 한번에 확장
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 
@@ -67,8 +67,6 @@ static char *heap_listp = 0;        // allocator가 관리하는 첫 블록을 �
 #define PREV_BLKP(bp)   ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE)))   // 이전 블록주소
 
 // explicit
-#define UNSORTED_BIN_LENGTH 10
-
 #define MAX_SMALL_BIN       1024
 #define SMALL_BIN_LENGTH    129
 #define SMALL_BIN_UNIT      8
@@ -82,6 +80,8 @@ static char *heap_listp = 0;        // allocator가 관리하는 첫 블록을 �
 #define GET_PTR(p)          (*(char **)(p))             // 포인터가 저장된 포인터 읽기
 #define PUT_PTR(p, val)     (*(char **)(p) = (val))     // 포인터가 저장된 포인터 쓰기
 
+#define REMAIN              (3 * (DSIZE))
+
 
 static void *extend_heap(size_t words);
 static char *coalesce(void *bp);
@@ -94,112 +94,130 @@ static void del_from_bin(char *bp, size_t size);
 static char **find_head(char *bp, size_t size);
 static void block_split(char *bp, size_t asize, size_t remain_size);
 static void write_end_of_heap_block(char *bp, size_t asize);
+static size_t find_in_small_bin(size_t asize);
 
-static void print_fragmentation(size_t request_size)
+typedef struct heap_debug_stats
 {
-    char *bp = NEXT_BLKP(heap_listp);
+    size_t total_free;
+    size_t largest_free;
+    size_t free_count;
+    size_t alloc_count;
+} HeapDebugStats;
 
-    size_t total_free = 0;
-    size_t largest_free = 0;
-    size_t free_count = 0;
-    size_t total_alloc = 0;
-
-    printf("\n========== HEAP FRAGMENTATION ==========\n");
-    printf("request size : %zu\n", request_size);
-
-    while (GET_SIZE(HDRP(bp)) != 0)   // epilogue까지
-    {
-        size_t block_size = GET_SIZE(HDRP(bp));
-        int alloc = GET_ALLOC(HDRP(bp));
-
-        if (alloc)
-        {
-            total_alloc += block_size;
-        }
-        else
-        {
-            total_free += block_size;
-            free_count++;
-
-            if (block_size > largest_free)
-                largest_free = block_size;
-
-            printf(
-                "[FREE] bp=%p size=%zu\n",
-                bp,
-                block_size
-            );
-        }
-
-        bp = NEXT_BLKP(bp);
-    }
-
-    printf("----------------------------------------\n");
-    printf("total allocated : %zu\n", total_alloc);
-    printf("total free      : %zu\n", total_free);
-    printf("largest free    : %zu\n", largest_free);
-    printf("free blocks     : %zu\n", free_count);
-
-    if (total_free > 0)
-    {
-        double fragmentation =
-            1.0 - ((double)largest_free / (double)total_free);
-
-        printf(
-            "external fragmentation : %.2f %%\n",
-            fragmentation * 100.0
-        );
-    }
-
-    if (largest_free >= request_size)
-    {
-        printf(
-            ">>> WARNING: 충분한 free block이 존재함.\n"
-            ">>> 그런데 find_fit이 실패했다면 bin/find_fit 문제 가능성 큼.\n"
-        );
-    }
-    else if (total_free >= request_size)
-    {
-        printf(
-            ">>> FRAGMENTATION: 전체 free 메모리는 충분하지만\n"
-            ">>> 연속된 free block이 부족함.\n"
-        );
-    }
-    else
-    {
-        printf(
-            ">>> 실제 free 메모리 자체가 부족함.\n"
-        );
-    }
-
-    printf("========================================\n\n");
-}
-
-static void print_heap_blocks(void)
+static HeapDebugStats get_heap_debug_stats(void)
 {
+    HeapDebugStats stats = {0};
+
     char *bp = NEXT_BLKP(heap_listp);
-
-    printf("\n========== HEAP BLOCKS ==========\n");
-
-    int index = 0;
 
     while (GET_SIZE(HDRP(bp)) != 0)
     {
-        printf(
-            "[%d] bp=%p size=%zu %s\n",
-            index,
-            bp,
-            GET_SIZE(HDRP(bp)),
-            GET_ALLOC(HDRP(bp)) ? "ALLOC" : "FREE"
-        );
+        size_t block_size = GET_SIZE(HDRP(bp));
+
+        if (GET_ALLOC(HDRP(bp)))
+        {
+            stats.alloc_count++;
+        }
+        else
+        {
+            stats.free_count++;
+            stats.total_free += block_size;
+
+            if (block_size > stats.largest_free)
+                stats.largest_free = block_size;
+        }
 
         bp = NEXT_BLKP(bp);
-        index++;
     }
 
-    printf("[EPILOGUE]\n");
-    printf("=================================\n\n");
+    return stats;
 }
+
+static void print_free_histogram(void)
+{
+    size_t bucket[12] = {0};
+
+    char *bp = NEXT_BLKP(heap_listp);
+
+    while (GET_SIZE(HDRP(bp)) != 0)
+    {
+        if (!GET_ALLOC(HDRP(bp)))
+        {
+            size_t size = GET_SIZE(HDRP(bp));
+
+            if      (size <= 32)    bucket[0]++;
+            else if (size <= 64)    bucket[1]++;
+            else if (size <= 128)   bucket[2]++;
+            else if (size <= 256)   bucket[3]++;
+            else if (size <= 512)   bucket[4]++;
+            else if (size <= 1024)  bucket[5]++;
+            else if (size <= 2048)  bucket[6]++;
+            else if (size <= 4096)  bucket[7]++;
+            else if (size <= 8192)  bucket[8]++;
+            else if (size <= 16384) bucket[9]++;
+            else if (size <= 32768) bucket[10]++;
+            else                    bucket[11]++;
+        }
+
+        bp = NEXT_BLKP(bp);
+    }
+
+    printf(
+        "[FREE HIST] "
+        "<=32:%zu <=64:%zu <=128:%zu <=256:%zu "
+        "<=512:%zu <=1K:%zu <=2K:%zu <=4K:%zu "
+        "<=8K:%zu <=16K:%zu <=32K:%zu >32K:%zu\n",
+        bucket[0], bucket[1], bucket[2], bucket[3],
+        bucket[4], bucket[5], bucket[6], bucket[7],
+        bucket[8], bucket[9], bucket[10], bucket[11]
+    );
+}
+
+static void debug_before_extend(const char *from, size_t asize)
+{
+    HeapDebugStats stats = get_heap_debug_stats();
+
+    printf(
+        "\n[EXTEND] from=%s "
+        "request=%zu heap=%zu "
+        "total_free=%zu largest_free=%zu free_count=%zu\n",
+        from,
+        asize,
+        mem_heapsize(),
+        stats.total_free,
+        stats.largest_free,
+        stats.free_count
+    );
+
+    if (stats.largest_free >= asize)
+    {
+        printf(">>> FIND/BIN BUG: 충분한 연속 free block이 있는데 확장하려고 함\n");
+    }
+    else if (stats.total_free >= asize)
+    {
+        printf(">>> FRAGMENTATION: 총 free는 충분하지만 조각나 있음\n");
+    }
+    else
+    {
+        printf(">>> REAL SHORTAGE: 실제 free 메모리 부족\n");
+    }
+    print_free_histogram();
+}
+
+static void debug_place(size_t block_size, size_t asize)
+{
+    if (block_size >= asize * 4 && block_size >= 1024)
+    {
+        printf(
+            "[BAD FIT?] request=%zu selected=%zu remain=%zu\n",
+            asize,
+            block_size,
+            block_size - asize
+        );
+    }
+}
+
+
 
 typedef struct arena
 {
@@ -524,19 +542,15 @@ void *mm_malloc(size_t size)
     if ((bp = find_fit(asize)) != NULL)
     {
         place(bp, asize);
-        // print_fragmentation(asize);
-        // print_heap_blocks();
         return bp;
     }
-    
+    //debug_before_extend("malloc", asize);
     // free block을 못찾았을 때 힙을 늘림
     extendsize = MAX(asize, CHUNKSIZE);
     
     if ((bp = extend_heap(extendsize / WSIZE)) == NULL) return NULL;
 
     place(bp, asize);
-    // print_fragmentation(extendsize);
-    // print_heap_blocks();
     return bp;
 }
 
@@ -549,7 +563,7 @@ static void *find_fit(size_t asize)
 {
     // unsorted bin에서 찾기
     char *cur = arena.unsorted_bin;
-    while(cur != NULL && asize > GET_SIZE(HDRP(cur)))
+    while(cur != NULL && (asize > GET_SIZE(HDRP(cur)) || asize + asize / 4 < GET_SIZE(HDRP(cur))))
     {// 적절하지 못하면 즉시 small, large로 분류
         del_from_bin(cur, GET_SIZE(HDRP(cur)));
         classify_block(cur, GET_SIZE(HDRP(cur)));
@@ -612,17 +626,24 @@ static void *find_fit(size_t asize)
 static void place(void *bp, size_t asize)
 {
     size_t size = GET_SIZE(HDRP(bp));
-
+    //debug_place(size, asize);
     // 자르고 남는 블록 크기가 24Byte 미만일경우 분할하지 않음
-    if (size - asize < 3 * DSIZE)
+    if (size - asize < REMAIN)
     {
         PUT(HDRP(bp), PACK(size, 1));
         PUT(FTRP(bp), PACK(size, 1));  
         return;
     }
 
-    // 24 이상일경우 분할
-    block_split(bp, asize, size - asize);
+    // 분할하고 남는 용량의 크기가 이미 5개 이상일경우 분할하지 않음
+    size_t remain_size = size - asize;
+    // if (remain_size <= 1024 && 4 < find_in_small_bin(remain_size))
+    // {
+    //     PUT(HDRP(bp), PACK(size, 1));
+    //     PUT(FTRP(bp), PACK(size, 1));  
+    //     return;
+    // }
+    block_split(bp, asize, remain_size);
 
 
     // 분할하고 남은거 정리
@@ -710,7 +731,7 @@ void *mm_realloc(void *ptr, size_t size)
             size_t total_size = old_size + next_block_size;
             size_t remain_size = total_size - asize;
             // 최소 크기보다 작게 남으면 다 주기
-            if (remain_size < 3 * DSIZE )
+            if (remain_size < REMAIN)
             {
                 PUT(HDRP(ptr), PACK(total_size, 1));
                 PUT(FTRP(ptr), PACK(total_size, 1));
@@ -738,7 +759,7 @@ void *mm_realloc(void *ptr, size_t size)
             size_t remain_size = total_size - asize;
 
             // 최소 크기보다 작게 남으면 다 주기
-            if (remain_size < 3 * DSIZE )
+            if (remain_size < REMAIN)
             {
                 memmove(newptr, oldptr, copySize);
                 PUT(HDRP(newptr), PACK(total_size, 1));
@@ -770,7 +791,7 @@ void *mm_realloc(void *ptr, size_t size)
             size_t remain_size = total_size - asize;
 
             // 최소 크기보다 작게 남으면 다 주기
-            if (remain_size < 3 * DSIZE )
+            if (remain_size < REMAIN)
             {
                 memmove(newptr, oldptr, copySize);
                 PUT(HDRP(newptr), PACK(total_size, 1));
@@ -840,9 +861,8 @@ void *mm_realloc(void *ptr, size_t size)
         return oldptr;
     }
 
-    // 완전히 다른곳으로 확장
-    // 1. 적절한 블록이 있는지 탐색후 위치 옮기기
-    // 2. 적절한 블록이 없으면 확장 후 할당(malloc)
+    // 적절한 블록이 없어서 힙을 확장해야하는 경우
+
     newptr = mm_malloc(size);
     if (newptr == NULL) return NULL;
     copySize = GET_SIZE(HDRP(oldptr)) - DSIZE;
@@ -869,4 +889,24 @@ static void block_split(char *bp, size_t asize, size_t remain_size)
     // 남은 블록
     PUT(HDRP(NEXT_BLKP(bp)), PACK(remain_size, 0));
     PUT(FTRP(NEXT_BLKP(bp)), PACK(remain_size, 0));
+}
+
+static size_t find_in_small_bin(size_t asize)
+{
+    // small bin에서 찾기
+    size_t s_i = (size_t)(asize / SMALL_BIN_UNIT);
+
+    if (arena.small_bin[s_i] == NULL)
+    {
+        return 0;
+    }
+
+    size_t count = 0;
+    char *cur = arena.small_bin[s_i];
+    while(cur != NULL)
+    {
+        count++;
+        cur = GET_PTR(NEXT_FREE_PTR(cur));
+    }
+    return count;
 }
