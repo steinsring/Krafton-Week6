@@ -48,7 +48,7 @@ static char *heap_listp = 0;        // allocator가 관리하는 첫 블록을 �
 
 #define WSIZE           4           // WORD
 #define DSIZE           8           // DOUBLE WORD
-#define CHUNKSIZE       (1<<12)     // 힙 확장시 4096바이트 한번에 확장
+#define CHUNKSIZE       (1<<6)     // 힙 확장시 4096바이트 한번에 확장
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 
@@ -92,6 +92,112 @@ static void insert_linked_list(char *prev, char* cur);
 static void del_linked_list(char *prev, char* cur);
 static void del_from_bin(char *bp, size_t size);
 static char **find_head(char *bp, size_t size);
+
+static void print_fragmentation(size_t request_size)
+{
+    char *bp = NEXT_BLKP(heap_listp);
+
+    size_t total_free = 0;
+    size_t largest_free = 0;
+    size_t free_count = 0;
+    size_t total_alloc = 0;
+
+    printf("\n========== HEAP FRAGMENTATION ==========\n");
+    printf("request size : %zu\n", request_size);
+
+    while (GET_SIZE(HDRP(bp)) != 0)   // epilogue까지
+    {
+        size_t block_size = GET_SIZE(HDRP(bp));
+        int alloc = GET_ALLOC(HDRP(bp));
+
+        if (alloc)
+        {
+            total_alloc += block_size;
+        }
+        else
+        {
+            total_free += block_size;
+            free_count++;
+
+            if (block_size > largest_free)
+                largest_free = block_size;
+
+            printf(
+                "[FREE] bp=%p size=%zu\n",
+                bp,
+                block_size
+            );
+        }
+
+        bp = NEXT_BLKP(bp);
+    }
+
+    printf("----------------------------------------\n");
+    printf("total allocated : %zu\n", total_alloc);
+    printf("total free      : %zu\n", total_free);
+    printf("largest free    : %zu\n", largest_free);
+    printf("free blocks     : %zu\n", free_count);
+
+    if (total_free > 0)
+    {
+        double fragmentation =
+            1.0 - ((double)largest_free / (double)total_free);
+
+        printf(
+            "external fragmentation : %.2f %%\n",
+            fragmentation * 100.0
+        );
+    }
+
+    if (largest_free >= request_size)
+    {
+        printf(
+            ">>> WARNING: 충분한 free block이 존재함.\n"
+            ">>> 그런데 find_fit이 실패했다면 bin/find_fit 문제 가능성 큼.\n"
+        );
+    }
+    else if (total_free >= request_size)
+    {
+        printf(
+            ">>> FRAGMENTATION: 전체 free 메모리는 충분하지만\n"
+            ">>> 연속된 free block이 부족함.\n"
+        );
+    }
+    else
+    {
+        printf(
+            ">>> 실제 free 메모리 자체가 부족함.\n"
+        );
+    }
+
+    printf("========================================\n\n");
+}
+
+static void print_heap_blocks(void)
+{
+    char *bp = NEXT_BLKP(heap_listp);
+
+    printf("\n========== HEAP BLOCKS ==========\n");
+
+    int index = 0;
+
+    while (GET_SIZE(HDRP(bp)) != 0)
+    {
+        printf(
+            "[%d] bp=%p size=%zu %s\n",
+            index,
+            bp,
+            GET_SIZE(HDRP(bp)),
+            GET_ALLOC(HDRP(bp)) ? "ALLOC" : "FREE"
+        );
+
+        bp = NEXT_BLKP(bp);
+        index++;
+    }
+
+    printf("[EPILOGUE]\n");
+    printf("=================================\n\n");
+}
 
 typedef struct arena
 {
@@ -182,7 +288,7 @@ static void *extend_heap(size_t words)
 
     PUT(HDRP(block_pointer), PACK(size, 0));            // 블록의 헤더 작성
     PUT(FTRP(block_pointer), PACK(size, 0));            // 블록의 푸터 작성
-    PUT(HDRP(NEXT_BLKP(block_pointer)), PACK(0, 1));    // 다음 빈 블록 주소 헤더 작성
+    PUT(HDRP(NEXT_BLKP(block_pointer)), PACK(0, 1));    // epilogue 주소 헤더 작성
 
     // 포인터 초기화
     PUT_PTR(PREV_FREE_PTR(block_pointer), NULL);
@@ -418,14 +524,19 @@ void *mm_malloc(size_t size)
     if ((bp = find_fit(asize)) != NULL)
     {
         place(bp, asize);
+        // print_fragmentation(asize);
+        // print_heap_blocks();
         return bp;
     }
-
+    
     // free block을 못찾았을 때 힙을 늘림
     extendsize = MAX(asize, CHUNKSIZE);
+    
     if ((bp = extend_heap(extendsize / WSIZE)) == NULL) return NULL;
 
     place(bp, asize);
+    // print_fragmentation(extendsize);
+    // print_heap_blocks();
     return bp;
 }
 
@@ -545,10 +656,9 @@ void mm_free(void *bp)
  */
 void *mm_realloc(void *ptr, size_t size)
 {
-    // 요청한 크기보다 이미 가지고 있는 크기가 더 크면 분할 후 리턴
     if (!ptr)
     {
-        mm_malloc(size);
+        return mm_malloc(size);
     }
 
     if (size == 0)  
@@ -556,6 +666,8 @@ void *mm_realloc(void *ptr, size_t size)
         mm_free(ptr);
         return NULL;    // 요청 크기가 0
     }
+
+    // 요청한 크기보다 이미 가지고 있는 크기가 더 크면 분할 후 리턴
 
     size_t old_size = GET_SIZE(HDRP(ptr));
     size_t asize;                   // 정렬에 맞춰진 크기
@@ -569,50 +681,197 @@ void *mm_realloc(void *ptr, size_t size)
         return ptr;
     }
 
-    // 블록을 확장해야할 경우
+    void *oldptr = ptr;
+    void *newptr;
 
-    // 1. 제자리 확장 (오른쪽 블록 병합)
+    size_t copySize;
+    copySize = GET_SIZE(HDRP(oldptr)) - DSIZE;
+    if (size < copySize)    copySize = size;    // 복사량을 기존 payload에 맞춘다.
+
+    // 블록을 병합해야할 경우
+
+    size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(ptr))); // 이전 빈 블록 할당 플래그
+    size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(ptr))); // 다음 빈 블록 할당 플래그
+
+    size_t prev_block_size = GET_SIZE(HDRP(PREV_BLKP(ptr)));
     size_t next_block_size = GET_SIZE(HDRP(NEXT_BLKP(ptr)));
-    if (!GET_ALLOC(HDRP(NEXT_BLKP(ptr))) && (old_size + next_block_size >= asize))
+
+    if (prev_alloc && next_alloc)
     {
-        // 이제 사용할 블록이므로 bin에서 제거
-        del_from_bin(NEXT_BLKP(ptr), next_block_size);
-        
-        // 적절히 잘라서 병합하고 남은건 분류
-        size_t total_size = old_size + next_block_size;
-        size_t remain_size = total_size - asize;
-        // 최소 크기보다 작게 남으면 다 주기
-        if (remain_size < 3 * DSIZE )
+
+    }
+    else if (prev_alloc && !next_alloc)
+    {
+        // 1. 제자리, 오른쪽 블록 병합
+        if (old_size + next_block_size >= asize)
         {
-            PUT(HDRP(ptr), PACK(total_size, 1));
-            PUT(FTRP(ptr), PACK(total_size, 1));
+            // 이제 사용할 블록이므로 bin에서 제거
+            del_from_bin(NEXT_BLKP(ptr), next_block_size);
+            
+            // 적절히 잘라서 병합하고 남은건 분류
+            size_t total_size = old_size + next_block_size;
+            size_t remain_size = total_size - asize;
+            // 최소 크기보다 작게 남으면 다 주기
+            if (remain_size < 3 * DSIZE )
+            {
+                PUT(HDRP(ptr), PACK(total_size, 1));
+                PUT(FTRP(ptr), PACK(total_size, 1));
+                return ptr;
+            }
+
+            // 아니면 쓸만큼 쓰고 분할해서 분류
+            PUT(HDRP(ptr), PACK(asize, 1));
+            PUT(FTRP(ptr), PACK(asize, 1));
+
+            PUT(HDRP(NEXT_BLKP(ptr)), PACK(remain_size, 0));
+            PUT(FTRP(NEXT_BLKP(ptr)), PACK(remain_size, 0));
+
+            classify_block(NEXT_BLKP(ptr), remain_size);
             return ptr;
         }
+    }
+    else if (!prev_alloc && next_alloc)
+    {
+        // 2. 블록을 왼쪽으로 옮겨야 할 경우
+        // 2 - 1. 왼쪽이 비어있는데 병합하면 공간이 충분한 경우
+        newptr =  PREV_BLKP(ptr);
 
-        // 아니면 쓸만큼 쓰고 분할해서 분류
-        PUT(HDRP(ptr), PACK(asize, 1));
-        PUT(FTRP(ptr), PACK(asize, 1));
+        if (old_size + prev_block_size >= asize)
+        {
+            del_from_bin(PREV_BLKP(ptr), prev_block_size);
 
-        PUT(HDRP(NEXT_BLKP(ptr)), PACK(remain_size, 0));
-        PUT(FTRP(NEXT_BLKP(ptr)), PACK(remain_size, 0));
+            // 적절히 잘라서 병합하고 남은건 분류
+            size_t total_size = old_size + prev_block_size;
+            size_t remain_size = total_size - asize;
 
-        classify_block(NEXT_BLKP(ptr), remain_size);
+            // 최소 크기보다 작게 남으면 다 주기
+            if (remain_size < 3 * DSIZE )
+            {
+                memmove(newptr, oldptr, copySize);
+                PUT(HDRP(newptr), PACK(total_size, 1));
+                PUT(FTRP(newptr), PACK(total_size, 1));
+                return newptr;
+            }
+
+            // 아니면 쓸만큼 쓰고 분할해서 분류
+            memmove(newptr, oldptr, copySize);
+            PUT(HDRP(newptr), PACK(asize, 1));
+            PUT(FTRP(newptr), PACK(asize, 1));
+
+            PUT(HDRP(NEXT_BLKP(newptr)), PACK(remain_size, 0));
+            PUT(FTRP(NEXT_BLKP(newptr)), PACK(remain_size, 0));
+
+            classify_block(NEXT_BLKP(newptr), remain_size);
+            return newptr;
+        }
+    }
+    else
+    {
+        // 2 - 1 - 3. 왼쪽과 오른쪽이 비어있는데 병합하면 공간이 충분한 경우
+        if (old_size + prev_block_size + next_block_size >= asize)
+        {
+            newptr =  PREV_BLKP(ptr);
+
+            del_from_bin(PREV_BLKP(ptr), prev_block_size);
+            del_from_bin(NEXT_BLKP(ptr), next_block_size);
+
+            // 적절히 잘라서 병합하고 남은건 분류
+            size_t total_size = old_size + prev_block_size + next_block_size;
+            size_t remain_size = total_size - asize;
+
+            // 최소 크기보다 작게 남으면 다 주기
+            if (remain_size < 3 * DSIZE )
+            {
+                memmove(newptr, oldptr, copySize);
+                PUT(HDRP(newptr), PACK(total_size, 1));
+                PUT(FTRP(newptr), PACK(total_size, 1));
+                return newptr;
+            }
+
+            // 아니면 쓸만큼 쓰고 분할해서 분류
+            memmove(newptr, oldptr, copySize);
+            PUT(HDRP(newptr), PACK(asize, 1));
+            PUT(FTRP(newptr), PACK(asize, 1));
+
+            PUT(HDRP(NEXT_BLKP(newptr)), PACK(remain_size, 0));
+            PUT(FTRP(NEXT_BLKP(newptr)), PACK(remain_size, 0));
+
+            classify_block(NEXT_BLKP(newptr), remain_size);
+            return newptr;
+        }
+    }
+
+    // asize 이상 크기의 free block을 찾고 할당해야하는 경우
+    if ((newptr = find_fit(asize)) != NULL)
+    {
+        // 완전히 다른곳으로 이동
+        // 3 - 1. 적절한 블록이 있는지 탐색후 위치 옮기기
+        // 3 - 2. 적절한 블록이 없으면 확장 후 할당(malloc)
+        place(newptr, asize);
+        memcpy(newptr, oldptr, copySize);
+        mm_free(oldptr);
+        return newptr;
+    }
+    
+    // 블록을 확장해야할 경우
+    // 1. 왼쪽은 할당, 요청받은 블록이 힙 끝이면 그대로 확장만
+    if (prev_alloc && next_alloc && next_block_size == 0)
+    {
+        // mem_sbrk는 확장하기 전 힙의 끝 주소를 반환한다.
+        // 필요한 payload만큼 요청
+        if ((long)(mem_sbrk(asize - old_size)) == -1)  return NULL; // 힙 확장 실패시 NULL
+
+        PUT(HDRP(ptr), PACK(asize, 1));            // 블록의 헤더 작성
+        PUT(FTRP(ptr), PACK(asize, 1));            // 블록의 푸터 작성
+        PUT(HDRP(NEXT_BLKP(ptr)), PACK(0, 1));     // epilogue 주소 헤더 작성
+
         return ptr;
     }
 
-    // 2. 적절한 블록이 있는지 탐색후 위치 옮기기
-    // 3. 적절한 블록이 없으면 확장 후 할당
-    void *oldptr = ptr;
-    void *newptr;
-    size_t copySize;
+    // 2. 왼쪽 병합했는데 공간이 부족, 그런데 힙의 끝이어서 제자리 확장이 가능한 경우
+    if (!prev_alloc && (old_size + prev_block_size < asize) && 
+        next_alloc && next_block_size == 0)
+    {
+        // mem_sbrk는 확장하기 전 힙의 끝 주소를 반환한다.
+        // 필요한 payload만큼 요청
+        if ((long)(mem_sbrk(asize - (old_size + prev_block_size))) == -1)  return NULL; // 힙 확장 실패시 NULL
+        
+        del_from_bin(PREV_BLKP(ptr), prev_block_size);
 
+        memmove(newptr, oldptr, copySize);
+        PUT(HDRP(newptr), PACK(asize, 1));            // 블록의 헤더 작성
+        PUT(FTRP(newptr), PACK(asize, 1));            // 블록의 푸터 작성
+        PUT(HDRP(NEXT_BLKP(newptr)), PACK(0, 1));     // epilogue 주소 헤더 작성
+
+        return newptr;
+    }
+
+    // 3. 제자리, 오른쪽 블록 병합 해도 부족한데, 힙 끝인 경우 확장
+    if (prev_alloc && !next_alloc && old_size + next_block_size < asize && GET_SIZE(HDRP(NEXT_BLKP(NEXT_BLKP(oldptr)))) == 0)
+    {
+        // mem_sbrk는 확장하기 전 힙의 끝 주소를 반환한다.
+        // 필요한 payload만큼 요청
+        if ((long)(mem_sbrk(asize - (old_size + next_block_size))) == -1)  return NULL; // 힙 확장 실패시 NULL
+        
+        del_from_bin(NEXT_BLKP(oldptr), next_block_size);
+
+        PUT(HDRP(oldptr), PACK(asize, 1));            // 블록의 헤더 작성
+        PUT(FTRP(oldptr), PACK(asize, 1));            // 블록의 푸터 작성
+        PUT(HDRP(NEXT_BLKP(oldptr)), PACK(0, 1));     // epilogue 주소 헤더 작성
+
+        return oldptr;
+    }
+
+    // 완전히 다른곳으로 확장
+    // 1. 적절한 블록이 있는지 탐색후 위치 옮기기
+    // 2. 적절한 블록이 없으면 확장 후 할당(malloc)
     newptr = mm_malloc(size);
     if (newptr == NULL) return NULL;
     copySize = GET_SIZE(HDRP(oldptr)) - DSIZE;
 
-if (size < copySize)
-    copySize = size;
+    if (size < copySize)    copySize = size;    // 복사량을 기존 payload에 맞춘다.
     memcpy(newptr, oldptr, copySize);
     mm_free(oldptr);
     return newptr;
 }
+
