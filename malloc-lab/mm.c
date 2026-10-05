@@ -195,9 +195,12 @@ static void *extend_heap(size_t words)
 
 static void del_from_bin(char *bp, size_t size)
 {
+    if (bp == NULL) return;
+
     if (GET_PTR(PREV_FREE_PTR(bp)) == NULL && GET_PTR(NEXT_FREE_PTR(bp)) == NULL)
     {
         char **head = find_head(bp, size);
+        //if (**head == NULL) return;
         if (*head != NULL)  *head = NULL;
         return;
     }
@@ -572,7 +575,7 @@ void *mm_realloc(void *ptr, size_t size)
     size_t next_block_size = GET_SIZE(HDRP(NEXT_BLKP(ptr)));
     if (!GET_ALLOC(HDRP(NEXT_BLKP(ptr))) && (old_size + next_block_size >= asize))
     {
-        // 이제 사용할 블록
+        // 이제 사용할 블록이므로 bin에서 제거
         del_from_bin(NEXT_BLKP(ptr), next_block_size);
         
         // 적절히 잘라서 병합하고 남은건 분류
@@ -598,22 +601,17 @@ void *mm_realloc(void *ptr, size_t size)
     }
 
     // 2. 적절한 블록이 있는지 탐색후 위치 옮기기
-
     // 3. 적절한 블록이 없으면 확장 후 할당
-
-
-
     void *oldptr = ptr;
     void *newptr;
     size_t copySize;
 
-
     newptr = mm_malloc(size);
-    if (newptr == NULL)
-        return NULL;
-    copySize = *(size_t *)((char *)oldptr - SIZE_T_SIZE);
-    if (size < copySize)
-        copySize = size;
+    if (newptr == NULL) return NULL;
+    copySize = GET_SIZE(HDRP(oldptr)) - DSIZE;
+
+if (size < copySize)
+    copySize = size;
     memcpy(newptr, oldptr, copySize);
     mm_free(oldptr);
     return newptr;

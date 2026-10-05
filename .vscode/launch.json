@@ -9,7 +9,7 @@
             "args": [
                 "-V",
                 "-f",
-                "short1-bal.rep",
+                "traces/realloc-bal.rep",
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/malloc-lab",
