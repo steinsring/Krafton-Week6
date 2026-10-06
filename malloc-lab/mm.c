@@ -83,8 +83,9 @@ static char *heap_listp = 0;        // allocator가 관리하는 첫 블록을 �
 #define REMAIN              (3 * (DSIZE))
 
 #define EXCLUSIVE           10
-#define EX_PACK(size, exclusive, alloc)    ((size) | ((exclusive) << 1) | (alloc))  
-#define IS_EX(p)            (GET(p) & 0x2)
+#define EX_PACK(size, first, exclusive, alloc)    ((size) | ((first) << 2) | ((exclusive) << 1) | (alloc))  
+#define IS_EX(p)            ((GET(p) & 0x2) >> 1)
+#define IS_FIRST(p)         ((GET(p) & 0x4) >> 2)
 
 
 static void *extend_heap(size_t words);
@@ -108,81 +109,6 @@ typedef struct arena
     char *small_bin[SMALL_BIN_LENGTH];     // 24 ~ 1024
     char *large_bin[LARGE_BIN_LENGTH];     // 1024 ~ 10240 이상
 } Arena;
-
-static void print_heap_state(const char *event)
-{
-    char *bp = NEXT_BLKP(heap_listp);
-    int index = 0;
-
-    printf("\n========== HEAP STATE : %s ==========\n", event);
-    printf("heap start=%p  heap size=%zu\n",
-           mem_heap_lo(), mem_heapsize());
-
-    while (1)
-    {
-        size_t size = GET_SIZE(HDRP(bp));
-        int alloc = GET_ALLOC(HDRP(bp));
-        int ex = IS_EX(HDRP(bp)) ? 1 : 0;
-
-        /* epilogue */
-        if (size == 0)
-        {
-            printf(
-                "[%d] EPILOGUE "
-                "bp=%p hdr=%p alloc=%d ex=%d\n",
-                index,
-                bp,
-                HDRP(bp),
-                alloc,
-                ex
-            );
-
-            /* size 0인데 free면 비정상 */
-            if (!alloc)
-                printf(">>> ERROR: size 0 FREE block detected\n");
-
-            break;
-        }
-
-        printf(
-            "[%d] bp=%p "
-            "size=%zu "
-            "%s "
-            "EX=%d "
-            "hdr=%p ftr=%p "
-            "range=[%p ~ %p]\n",
-            index,
-            bp,
-            size,
-            alloc ? "ALLOC" : "FREE ",
-            ex,
-            HDRP(bp),
-            FTRP(bp),
-            HDRP(bp),
-            FTRP(bp)
-        );
-
-        char *next = NEXT_BLKP(bp);
-
-        /* 잘못된 size 때문에 무한루프 방지 */
-        if (next <= bp)
-        {
-            printf(
-                ">>> ERROR: invalid next block "
-                "bp=%p next=%p size=%zu\n",
-                bp,
-                next,
-                size
-            );
-            break;
-        }
-
-        bp = next;
-        index++;
-    }
-
-    printf("=====================================\n\n");
-}
 
 static Arena arena;                   // NULL
 
@@ -290,13 +216,13 @@ static void *extend_heap(size_t words)
 
     if (small_size <= MAX_SMALL_BIN) 
     {
-        PUT(HDRP(block_pointer), EX_PACK(small_size, 1, 1));   // 전용 블록의 헤더 작성
-        PUT(FTRP(block_pointer), EX_PACK(small_size, 1, 1));   // 전용 블록의 푸터 작성
+        PUT(HDRP(block_pointer), EX_PACK(small_size, 1, 1, 1));   // 전용 블록의 첫번째 헤더 작성
+        PUT(FTRP(block_pointer), EX_PACK(small_size, 1, 1, 1));   // 전용 블록의 첫번째 푸터 작성
         char *cur = block_pointer + small_size;
-        for (int i = 2; i <= EXCLUSIVE; i++)
+        for (int i = 0; i < EXCLUSIVE - 1; i++)
         {
-            PUT(HDRP(cur), EX_PACK(small_size, 1, 0));   // 전용 블록의 헤더 작성
-            PUT(FTRP(cur), EX_PACK(small_size, 1, 0));   // 전용 블록의 푸터 작성
+            PUT(HDRP(cur), EX_PACK(small_size, 0, 1, 0));   // 전용 블록의 헤더 작성
+            PUT(FTRP(cur), EX_PACK(small_size, 0, 1, 0));   // 전용 블록의 푸터 작성
             classify_block(cur, small_size);
             cur += small_size;
         }
@@ -540,6 +466,7 @@ void *mm_malloc(size_t size)
     if ((bp = find_fit(asize)) != NULL)
     {
         place(bp, asize);
+
         return bp;
     }
     // free block을 못찾았을 때 힙을 늘림
@@ -548,14 +475,7 @@ void *mm_malloc(size_t size)
     if ((bp = extend_heap(extendsize / WSIZE)) == NULL) return NULL;
 
     place(bp, asize);
-    // printf(
-    // "[MALLOC] request=%zu asize=%zu return=%p\n",
-    // size,
-    // asize,
-    // bp
-    // );
 
-    //print_heap_state("after malloc");
     return bp;
 }
 
@@ -632,12 +552,14 @@ static void place(void *bp, size_t asize)
 {
     size_t size = GET_SIZE(HDRP(bp));
     size_t is_exclusive = IS_EX(HDRP(bp));
-    //debug_place(size, asize);
     // 전용 영역일 경우
     if (is_exclusive)
     {
-        PUT(HDRP(bp), EX_PACK(size, 1, 1));
-        PUT(FTRP(bp), EX_PACK(size, 1, 1));  
+        size_t is_first = IS_FIRST(HDRP(bp));
+        if(is_first) is_first = 1;
+        else         is_first = 0;
+        PUT(HDRP(bp), EX_PACK(size, is_first, 1, 1));
+        PUT(FTRP(bp), EX_PACK(size, is_first, 1, 1));  
         return;
     }
 
@@ -666,33 +588,71 @@ static void place(void *bp, size_t asize)
 void mm_free(void *bp)
 {
     size_t size = GET_SIZE(HDRP(bp));
-    //     printf(
-    //     "[FREE] bp=%p size=%zu\n",
-    //     bp,
-    //     size
-    // );
+
     size_t is_exclusive = IS_EX(HDRP(bp));
     if(is_exclusive) is_exclusive = 1;
     else  is_exclusive = 0;
 
-    PUT(HDRP(bp), EX_PACK(size, is_exclusive, 0));
-    PUT(FTRP(bp), EX_PACK(size, is_exclusive, 0));
+    size_t is_first = IS_FIRST(HDRP(bp));
+    if(is_first) is_first = 1;
+    else         is_first = 0;
 
-    // unsoretd bin에 넣기
-    if(!IS_EX(HDRP(bp))) 
+    PUT(HDRP(bp), EX_PACK(size, is_first, is_exclusive, 0));
+    PUT(FTRP(bp), EX_PACK(size, is_first, is_exclusive, 0));
+
+    // 전용 블록이 아니면 unsoretd bin에 넣기
+    if(!is_exclusive) 
     {
         char *merged = coalesce(bp);
         char *unsorted_head = arena.unsorted_bin;
 
         insert_head(unsorted_head, merged);
         arena.unsorted_bin = merged;
-        //print_heap_state("after free");
-    }
-    else    
-    {
-        classify_block(bp, GET_SIZE(HDRP(bp)));
+
+        return;
     }
 
+    // 전용 블록이라면 첫번째 전용 블록까지 탐색
+    char *first_ex = bp;
+    while(!IS_FIRST(HDRP(first_ex)))
+    {
+        first_ex = PREV_BLKP(first_ex);
+    }
+
+    char *cur = first_ex;
+    size_t small_size = GET_SIZE(HDRP(bp));
+    for (int i = 0; i < EXCLUSIVE; i++)
+    {
+        // 중간에 하나라도 할당되어있으면 그냥 분류시킴
+        if (GET_ALLOC(HDRP(cur)))
+        {
+            classify_block(bp, small_size);
+
+            return;
+        }
+        cur = NEXT_BLKP(cur);
+    }
+
+    // 한 영역이 전부 free 상태이므로 일반 블록으로 병합하고 분류한다.
+    cur = first_ex;
+    for (int i = 0; i < EXCLUSIVE; i++)
+    {
+        if(bp != cur) del_from_bin(cur, small_size);
+        cur = NEXT_BLKP(cur);
+    }
+
+    // 일반 블록으로 만들고 분류
+    size_t large_size = small_size * EXCLUSIVE;
+    
+    // 포인터 초기화
+    PUT_PTR(PREV_FREE_PTR(first_ex), NULL);
+    PUT_PTR(NEXT_FREE_PTR(first_ex), NULL);
+
+    // 일반 블록
+    PUT(HDRP(first_ex), EX_PACK(large_size, 0, 0, 0));   
+    PUT(FTRP(first_ex), EX_PACK(large_size, 0, 0, 0));   
+
+    classify_block(first_ex, large_size);    
 }
 
 /*
