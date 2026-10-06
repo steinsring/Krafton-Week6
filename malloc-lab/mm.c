@@ -82,6 +82,10 @@ static char *heap_listp = 0;        // allocator가 관리하는 첫 블록을 �
 
 #define REMAIN              (3 * (DSIZE))
 
+#define EXCLUSIVE           10
+#define EX_PACK(size, exclusive, alloc)    ((size) | ((exclusive) << 1) | (alloc))  
+#define IS_EX(p)            (GET(p) & 0x2)
+
 
 static void *extend_heap(size_t words);
 static char *coalesce(void *bp);
@@ -96,127 +100,6 @@ static void block_split(char *bp, size_t asize, size_t remain_size);
 static void write_end_of_heap_block(char *bp, size_t asize);
 static size_t find_in_small_bin(size_t asize);
 
-typedef struct heap_debug_stats
-{
-    size_t total_free;
-    size_t largest_free;
-    size_t free_count;
-    size_t alloc_count;
-} HeapDebugStats;
-
-static HeapDebugStats get_heap_debug_stats(void)
-{
-    HeapDebugStats stats = {0};
-
-    char *bp = NEXT_BLKP(heap_listp);
-
-    while (GET_SIZE(HDRP(bp)) != 0)
-    {
-        size_t block_size = GET_SIZE(HDRP(bp));
-
-        if (GET_ALLOC(HDRP(bp)))
-        {
-            stats.alloc_count++;
-        }
-        else
-        {
-            stats.free_count++;
-            stats.total_free += block_size;
-
-            if (block_size > stats.largest_free)
-                stats.largest_free = block_size;
-        }
-
-        bp = NEXT_BLKP(bp);
-    }
-
-    return stats;
-}
-
-static void print_free_histogram(void)
-{
-    size_t bucket[12] = {0};
-
-    char *bp = NEXT_BLKP(heap_listp);
-
-    while (GET_SIZE(HDRP(bp)) != 0)
-    {
-        if (!GET_ALLOC(HDRP(bp)))
-        {
-            size_t size = GET_SIZE(HDRP(bp));
-
-            if      (size <= 32)    bucket[0]++;
-            else if (size <= 64)    bucket[1]++;
-            else if (size <= 128)   bucket[2]++;
-            else if (size <= 256)   bucket[3]++;
-            else if (size <= 512)   bucket[4]++;
-            else if (size <= 1024)  bucket[5]++;
-            else if (size <= 2048)  bucket[6]++;
-            else if (size <= 4096)  bucket[7]++;
-            else if (size <= 8192)  bucket[8]++;
-            else if (size <= 16384) bucket[9]++;
-            else if (size <= 32768) bucket[10]++;
-            else                    bucket[11]++;
-        }
-
-        bp = NEXT_BLKP(bp);
-    }
-
-    printf(
-        "[FREE HIST] "
-        "<=32:%zu <=64:%zu <=128:%zu <=256:%zu "
-        "<=512:%zu <=1K:%zu <=2K:%zu <=4K:%zu "
-        "<=8K:%zu <=16K:%zu <=32K:%zu >32K:%zu\n",
-        bucket[0], bucket[1], bucket[2], bucket[3],
-        bucket[4], bucket[5], bucket[6], bucket[7],
-        bucket[8], bucket[9], bucket[10], bucket[11]
-    );
-}
-
-static void debug_before_extend(const char *from, size_t asize)
-{
-    HeapDebugStats stats = get_heap_debug_stats();
-
-    printf(
-        "\n[EXTEND] from=%s "
-        "request=%zu heap=%zu "
-        "total_free=%zu largest_free=%zu free_count=%zu\n",
-        from,
-        asize,
-        mem_heapsize(),
-        stats.total_free,
-        stats.largest_free,
-        stats.free_count
-    );
-
-    if (stats.largest_free >= asize)
-    {
-        printf(">>> FIND/BIN BUG: 충분한 연속 free block이 있는데 확장하려고 함\n");
-    }
-    else if (stats.total_free >= asize)
-    {
-        printf(">>> FRAGMENTATION: 총 free는 충분하지만 조각나 있음\n");
-    }
-    else
-    {
-        printf(">>> REAL SHORTAGE: 실제 free 메모리 부족\n");
-    }
-    print_free_histogram();
-}
-
-static void debug_place(size_t block_size, size_t asize)
-{
-    if (block_size >= asize * 4 && block_size >= 1024)
-    {
-        printf(
-            "[BAD FIT?] request=%zu selected=%zu remain=%zu\n",
-            asize,
-            block_size,
-            block_size - asize
-        );
-    }
-}
-
 
 
 typedef struct arena
@@ -226,8 +109,88 @@ typedef struct arena
     char *large_bin[LARGE_BIN_LENGTH];     // 1024 ~ 10240 이상
 } Arena;
 
+static void print_heap_state(const char *event)
+{
+    char *bp = NEXT_BLKP(heap_listp);
+    int index = 0;
+
+    printf("\n========== HEAP STATE : %s ==========\n", event);
+    printf("heap start=%p  heap size=%zu\n",
+           mem_heap_lo(), mem_heapsize());
+
+    while (1)
+    {
+        size_t size = GET_SIZE(HDRP(bp));
+        int alloc = GET_ALLOC(HDRP(bp));
+        int ex = IS_EX(HDRP(bp)) ? 1 : 0;
+
+        /* epilogue */
+        if (size == 0)
+        {
+            printf(
+                "[%d] EPILOGUE "
+                "bp=%p hdr=%p alloc=%d ex=%d\n",
+                index,
+                bp,
+                HDRP(bp),
+                alloc,
+                ex
+            );
+
+            /* size 0인데 free면 비정상 */
+            if (!alloc)
+                printf(">>> ERROR: size 0 FREE block detected\n");
+
+            break;
+        }
+
+        printf(
+            "[%d] bp=%p "
+            "size=%zu "
+            "%s "
+            "EX=%d "
+            "hdr=%p ftr=%p "
+            "range=[%p ~ %p]\n",
+            index,
+            bp,
+            size,
+            alloc ? "ALLOC" : "FREE ",
+            ex,
+            HDRP(bp),
+            FTRP(bp),
+            HDRP(bp),
+            FTRP(bp)
+        );
+
+        char *next = NEXT_BLKP(bp);
+
+        /* 잘못된 size 때문에 무한루프 방지 */
+        if (next <= bp)
+        {
+            printf(
+                ">>> ERROR: invalid next block "
+                "bp=%p next=%p size=%zu\n",
+                bp,
+                next,
+                size
+            );
+            break;
+        }
+
+        bp = next;
+        index++;
+    }
+
+    printf("=====================================\n\n");
+}
+
 static Arena arena;                   // NULL
 
+/**
+ * @brief free리스트에 블록 삽입
+ * @param prev 삽입할 위치 이전 포인터
+ * @param cur 삽입할 블록 
+ */
 static void insert_linked_list(char *prev, char* cur)
 {
     // a -> c 에 b를 삽입
@@ -242,6 +205,11 @@ static void insert_linked_list(char *prev, char* cur)
     }
 }
 
+/**
+ * @brief free리스트에서 블록 제거
+ * @param prev 제거할 위치 이전 포인터
+ * @param cur 제거할 블록 
+ */
 static void del_linked_list(char *prev, char* cur)
 {
     // a -> b -> c 에서 b를 제거
@@ -257,6 +225,11 @@ static void del_linked_list(char *prev, char* cur)
     PUT_PTR(NEXT_FREE_PTR(cur), NULL);  
 }
 
+/**
+ * @brief arena head 변경
+ * @param head 삽입할 위치 헤드 포인터
+ * @param bp 삽입할 블록 
+ */
 static void insert_head(char *head, char* bp)
 {
     PUT_PTR(NEXT_FREE_PTR(bp), head);
@@ -285,10 +258,6 @@ int mm_init(void)
     PUT(heap_listp + (3 * WSIZE), PACK(0, 1));      // 4바이트 크기 epilogue header
     heap_listp += (2 * WSIZE);                      // 시작 포인터를 payload위치로
 
-    // 큰 free block 만들기 
-    char *bp;
-    if ((bp = extend_heap(CHUNKSIZE / WSIZE)) == NULL) return -1;
-    classify_block(bp, GET_SIZE(HDRP(bp)));
     return 0;
 }
 
@@ -303,6 +272,13 @@ static void *extend_heap(size_t words)
     size_t size;            // 블록의 사이즈
 
     size = (words % 2) ? (words + 1) * WSIZE : words * WSIZE;   // size를 짝수로 → 8바이트 정렬
+    size_t small_size = size;
+    // small 전용 영역 만들기
+    if (size <= MAX_SMALL_BIN)
+    {
+        size = size * EXCLUSIVE;
+    }
+
     // mem_sbrk는 확장하기 전 힙의 끝 주소를 반환한다.
     if ((long)(block_pointer = mem_sbrk(size)) == -1)  return NULL; // 힙 확장 실패시 NULL
 
@@ -312,11 +288,29 @@ static void *extend_heap(size_t words)
     PUT_PTR(PREV_FREE_PTR(block_pointer), NULL);
     PUT_PTR(NEXT_FREE_PTR(block_pointer), NULL);
 
-    return coalesce(block_pointer);
+    if (small_size <= MAX_SMALL_BIN) 
+    {
+        PUT(HDRP(block_pointer), EX_PACK(small_size, 1, 1));   // 전용 블록의 헤더 작성
+        PUT(FTRP(block_pointer), EX_PACK(small_size, 1, 1));   // 전용 블록의 푸터 작성
+        char *cur = block_pointer + small_size;
+        for (int i = 2; i <= EXCLUSIVE; i++)
+        {
+            PUT(HDRP(cur), EX_PACK(small_size, 1, 0));   // 전용 블록의 헤더 작성
+            PUT(FTRP(cur), EX_PACK(small_size, 1, 0));   // 전용 블록의 푸터 작성
+            classify_block(cur, small_size);
+            cur += small_size;
+        }
+        return block_pointer;    // small 전용
+    }
 
-    //return block_pointer;
+    return coalesce(block_pointer);
 }
 
+/**
+ * @brief bin에서 블록 제거
+ * @param bp 찾는 블록 포인터
+ * @param size 찾는 블록 사이즈
+ */
 static void del_from_bin(char *bp, size_t size)
 {
     if (bp == NULL) return;
@@ -371,14 +365,20 @@ static char* coalesce(void *bp)
     size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp))); // 다음 빈 블록 할당 플래그
     size_t size = GET_SIZE(HDRP(bp));                   // 블록의 크기
 
+    size_t is_exclusive = IS_EX(HDRP(bp));
+    size_t is_prev_exclusive = IS_EX(HDRP(PREV_BLKP(bp)));
+    size_t is_next_exclusive = IS_EX(HDRP(NEXT_BLKP(bp)));
+
     char *prev_bp = PREV_BLKP(bp);
     char *next_bp = NEXT_BLKP(bp);
+
+    if (is_exclusive)   return bp;
 
     if (prev_alloc && next_alloc)   
     {// 양쪽 모두 할당
 
     }
-    else if (prev_alloc && !next_alloc)
+    else if ((prev_alloc || is_prev_exclusive) && !next_alloc && !is_next_exclusive)
     {// 오른쪽만 빈 블록
 
         // 현재 빈 블록이 bin에 있다면 해제
@@ -391,7 +391,7 @@ static char* coalesce(void *bp)
         PUT(HDRP(bp), PACK(size, 0));                   // 블록 포인터는 중간으로
         PUT(FTRP(bp), PACK(size, 0));                   // 블록 포인터는 중간으로
     }
-    else if (!prev_alloc && next_alloc)
+    else if (!prev_alloc && !is_prev_exclusive && (next_alloc || is_next_exclusive))
     {// 왼쪽만 빈 블록
 
         // 현재 빈 블록이 bin에 있다면 해제
@@ -405,7 +405,7 @@ static char* coalesce(void *bp)
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));        // 블록 포인터는 왼쪽으로
         bp = PREV_BLKP(bp); 
     }
-    else
+    else if (!prev_alloc && !next_alloc && !is_prev_exclusive && !is_next_exclusive)
     {// 둘다 빈 블록
 
         // 현재 빈 블록이 bin에 있다면 해제
@@ -422,8 +422,6 @@ static char* coalesce(void *bp)
         PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
         bp = PREV_BLKP(bp);
     }
-
-    //classify_block(bp, size);
 
     return bp;
 }
@@ -544,13 +542,20 @@ void *mm_malloc(size_t size)
         place(bp, asize);
         return bp;
     }
-    //debug_before_extend("malloc", asize);
     // free block을 못찾았을 때 힙을 늘림
-    extendsize = MAX(asize, CHUNKSIZE);
-    
+    //extendsize = MAX(asize, CHUNKSIZE);
+    extendsize = asize;
     if ((bp = extend_heap(extendsize / WSIZE)) == NULL) return NULL;
 
     place(bp, asize);
+    // printf(
+    // "[MALLOC] request=%zu asize=%zu return=%p\n",
+    // size,
+    // asize,
+    // bp
+    // );
+
+    //print_heap_state("after malloc");
     return bp;
 }
 
@@ -597,10 +602,6 @@ static void *find_fit(size_t asize)
             arena.small_bin[s_i] = new_head;
             return p;
         }
-        else
-        {
-
-        }
     }
     // large bin에서 찾기
 
@@ -630,7 +631,17 @@ static void *find_fit(size_t asize)
 static void place(void *bp, size_t asize)
 {
     size_t size = GET_SIZE(HDRP(bp));
+    size_t is_exclusive = IS_EX(HDRP(bp));
     //debug_place(size, asize);
+    // 전용 영역일 경우
+    if (is_exclusive)
+    {
+        PUT(HDRP(bp), EX_PACK(size, 1, 1));
+        PUT(FTRP(bp), EX_PACK(size, 1, 1));  
+        return;
+    }
+
+    // 전용 영역이 아닐 경우
     // 자르고 남는 블록 크기가 24Byte 미만일경우 분할하지 않음
     if (size - asize < REMAIN)
     {
@@ -639,16 +650,9 @@ static void place(void *bp, size_t asize)
         return;
     }
 
-    // 분할하고 남는 용량의 크기가 이미 5개 이상일경우 분할하지 않음
     size_t remain_size = size - asize;
-    // if (remain_size <= 1024 && 4 < find_in_small_bin(remain_size))
-    // {
-    //     PUT(HDRP(bp), PACK(size, 1));
-    //     PUT(FTRP(bp), PACK(size, 1));  
-    //     return;
-    // }
-    block_split(bp, asize, remain_size);
 
+    block_split(bp, asize, remain_size);
 
     // 분할하고 남은거 정리
     char *merged = coalesce(NEXT_BLKP(bp));
@@ -662,16 +666,33 @@ static void place(void *bp, size_t asize)
 void mm_free(void *bp)
 {
     size_t size = GET_SIZE(HDRP(bp));
+    //     printf(
+    //     "[FREE] bp=%p size=%zu\n",
+    //     bp,
+    //     size
+    // );
+    size_t is_exclusive = IS_EX(HDRP(bp));
+    if(is_exclusive) is_exclusive = 1;
+    else  is_exclusive = 0;
 
-    PUT(HDRP(bp), PACK(size, 0));
-    PUT(FTRP(bp), PACK(size, 0));
+    PUT(HDRP(bp), EX_PACK(size, is_exclusive, 0));
+    PUT(FTRP(bp), EX_PACK(size, is_exclusive, 0));
 
     // unsoretd bin에 넣기
-    char *merged = coalesce(bp);
-    char *unsorted_head = arena.unsorted_bin;
+    if(!IS_EX(HDRP(bp))) 
+    {
+        char *merged = coalesce(bp);
+        char *unsorted_head = arena.unsorted_bin;
 
-    insert_head(unsorted_head, merged);
-    arena.unsorted_bin = merged;
+        insert_head(unsorted_head, merged);
+        arena.unsorted_bin = merged;
+        //print_heap_state("after free");
+    }
+    else    
+    {
+        classify_block(bp, GET_SIZE(HDRP(bp)));
+    }
+
 }
 
 /*
@@ -679,10 +700,7 @@ void mm_free(void *bp)
  */
 void *mm_realloc(void *ptr, size_t size)
 {
-    if (!ptr)
-    {
-        return mm_malloc(size);
-    }
+    if (!ptr)   return mm_malloc(size);
 
     if (size == 0)  
     {
@@ -690,19 +708,11 @@ void *mm_realloc(void *ptr, size_t size)
         return NULL;    // 요청 크기가 0
     }
 
-    // 요청한 크기보다 이미 가지고 있는 크기가 더 크면 분할 후 리턴
-
     size_t old_size = GET_SIZE(HDRP(ptr));
     size_t asize;                   // 정렬에 맞춰진 크기
 
     if (size <= 2 * DSIZE)  asize = 3 * DSIZE;  // 최소 크기(24) 할당
     else  asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);   // 헤더와 푸터를 더하고 DSIZE 배수로
-
-    if (old_size >= asize)
-    {
-        place(ptr, asize);
-        return ptr;
-    }
 
     void *oldptr = ptr;
     void *newptr;
@@ -711,103 +721,117 @@ void *mm_realloc(void *ptr, size_t size)
     copySize = GET_SIZE(HDRP(oldptr)) - DSIZE;
     if (size < copySize)    copySize = size;    // 복사량을 기존 payload에 맞춘다.
 
+    // 요청한 크기보다 이미 가지고 있는 크기가 더 크면 분할 후 리턴
+    if (old_size >= asize)
+    {
+        place(ptr, asize);  // 전용 영역인경우 옮기는 최적화 필요
+        return ptr;
+    }
+
     // 블록을 병합해야할 경우
 
     size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(ptr))); // 이전 빈 블록 할당 플래그
     size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(ptr))); // 다음 빈 블록 할당 플래그
 
+    size_t is_exclusive = IS_EX(HDRP(ptr));
+    size_t is_prev_exclusive = IS_EX(FTRP(PREV_BLKP(ptr)));
+    size_t is_next_exclusive = IS_EX(HDRP(NEXT_BLKP(ptr)));
+
     size_t prev_block_size = GET_SIZE(HDRP(PREV_BLKP(ptr)));
     size_t next_block_size = GET_SIZE(HDRP(NEXT_BLKP(ptr)));
 
-    if (prev_alloc && next_alloc)
+    if (!is_exclusive)  // 현재블록이 전용블록이 아니어야함.
     {
-
-    }
-    else if (prev_alloc && !next_alloc)
-    {
-        // 1. 제자리, 오른쪽 블록 병합
-        if (old_size + next_block_size >= asize)
+        if (prev_alloc && next_alloc)
         {
-            // 이제 사용할 블록이므로 bin에서 제거
-            del_from_bin(NEXT_BLKP(ptr), next_block_size);
-            
-            // 적절히 잘라서 병합하고 남은건 분류
-            size_t total_size = old_size + next_block_size;
-            size_t remain_size = total_size - asize;
-            // 최소 크기보다 작게 남으면 다 주기
-            if (remain_size < REMAIN)
+
+        }
+        else if ((prev_alloc || is_prev_exclusive) && !next_alloc && !is_next_exclusive)
+        {
+            // 1. 제자리, 오른쪽 블록 병합
+            if (old_size + next_block_size >= asize)
             {
-                PUT(HDRP(ptr), PACK(total_size, 1));
-                PUT(FTRP(ptr), PACK(total_size, 1));
+                // 이제 사용할 블록이므로 bin에서 제거
+                del_from_bin(NEXT_BLKP(ptr), next_block_size);
+                
+                // 적절히 잘라서 병합하고 남은건 분류
+                size_t total_size = old_size + next_block_size;
+                size_t remain_size = total_size - asize;
+                // 최소 크기보다 작게 남으면 다 주기
+                if (remain_size < REMAIN)
+                {
+                    PUT(HDRP(ptr), PACK(total_size, 1));
+                    PUT(FTRP(ptr), PACK(total_size, 1));
+                    return ptr;
+                }
+
+                // 아니면 쓸만큼 쓰고 분할해서 분류
+                block_split(ptr, asize, remain_size);
+                classify_block(NEXT_BLKP(ptr), remain_size);
                 return ptr;
             }
-
-            // 아니면 쓸만큼 쓰고 분할해서 분류
-            block_split(ptr, asize, remain_size);
-            classify_block(NEXT_BLKP(ptr), remain_size);
-            return ptr;
         }
-    }
-    else if (!prev_alloc && next_alloc)
-    {
-        // 2. 블록을 왼쪽으로 옮겨야 할 경우
-        // 2 - 1. 왼쪽이 비어있는데 병합하면 공간이 충분한 경우
-        newptr =  PREV_BLKP(ptr);
-
-        if (old_size + prev_block_size >= asize)
+        else if (!prev_alloc && !is_prev_exclusive && (next_alloc || is_next_exclusive))
         {
-            del_from_bin(PREV_BLKP(ptr), prev_block_size);
-
-            // 적절히 잘라서 병합하고 남은건 분류
-            size_t total_size = old_size + prev_block_size;
-            size_t remain_size = total_size - asize;
-
-            // 최소 크기보다 작게 남으면 다 주기
-            if (remain_size < REMAIN)
-            {
-                memmove(newptr, oldptr, copySize);
-                PUT(HDRP(newptr), PACK(total_size, 1));
-                PUT(FTRP(newptr), PACK(total_size, 1));
-                return newptr;
-            }
-
-            // 아니면 쓸만큼 쓰고 분할해서 분류
-            memmove(newptr, oldptr, copySize);
-            block_split(newptr, asize, remain_size);
-
-
-            classify_block(NEXT_BLKP(newptr), remain_size);
-            return newptr;
-        }
-    }
-    else
-    {
-        // 2 - 1 - 3. 왼쪽과 오른쪽이 비어있는데 병합하면 공간이 충분한 경우
-        if (old_size + prev_block_size + next_block_size >= asize)
-        {
+            // 2. 블록을 왼쪽으로 옮겨야 할 경우
+            // 2 - 1. 왼쪽이 비어있는데 병합하면 공간이 충분한 경우
             newptr =  PREV_BLKP(ptr);
 
-            del_from_bin(PREV_BLKP(ptr), prev_block_size);
-            del_from_bin(NEXT_BLKP(ptr), next_block_size);
-
-            // 적절히 잘라서 병합하고 남은건 분류
-            size_t total_size = old_size + prev_block_size + next_block_size;
-            size_t remain_size = total_size - asize;
-
-            // 최소 크기보다 작게 남으면 다 주기
-            if (remain_size < REMAIN)
+            if (old_size + prev_block_size >= asize)
             {
+                del_from_bin(PREV_BLKP(ptr), prev_block_size);
+
+                // 적절히 잘라서 병합하고 남은건 분류
+                size_t total_size = old_size + prev_block_size;
+                size_t remain_size = total_size - asize;
+
+                // 최소 크기보다 작게 남으면 다 주기
+                if (remain_size < REMAIN)
+                {
+                    memmove(newptr, oldptr, copySize);
+                    PUT(HDRP(newptr), PACK(total_size, 1));
+                    PUT(FTRP(newptr), PACK(total_size, 1));
+                    return newptr;
+                }
+
+                // 아니면 쓸만큼 쓰고 분할해서 분류
                 memmove(newptr, oldptr, copySize);
-                PUT(HDRP(newptr), PACK(total_size, 1));
-                PUT(FTRP(newptr), PACK(total_size, 1));
+                block_split(newptr, asize, remain_size);
+
+
+                classify_block(NEXT_BLKP(newptr), remain_size);
                 return newptr;
             }
+        }
+        else if (!prev_alloc && !next_alloc && !is_prev_exclusive && !is_next_exclusive)
+        {
+            // 2 - 1 - 3. 왼쪽과 오른쪽이 비어있는데 병합하면 공간이 충분한 경우
+            if (old_size + prev_block_size + next_block_size >= asize)
+            {
+                newptr =  PREV_BLKP(ptr);
 
-            // 아니면 쓸만큼 쓰고 분할해서 분류
-            memmove(newptr, oldptr, copySize);
-            block_split(newptr, asize, remain_size);
-            classify_block(NEXT_BLKP(newptr), remain_size);
-            return newptr;
+                del_from_bin(PREV_BLKP(ptr), prev_block_size);
+                del_from_bin(NEXT_BLKP(ptr), next_block_size);
+
+                // 적절히 잘라서 병합하고 남은건 분류
+                size_t total_size = old_size + prev_block_size + next_block_size;
+                size_t remain_size = total_size - asize;
+
+                // 최소 크기보다 작게 남으면 다 주기
+                if (remain_size < REMAIN)
+                {
+                    memmove(newptr, oldptr, copySize);
+                    PUT(HDRP(newptr), PACK(total_size, 1));
+                    PUT(FTRP(newptr), PACK(total_size, 1));
+                    return newptr;
+                }
+
+                // 아니면 쓸만큼 쓰고 분할해서 분류
+                memmove(newptr, oldptr, copySize);
+                block_split(newptr, asize, remain_size);
+                classify_block(NEXT_BLKP(newptr), remain_size);
+                return newptr;
+            }
         }
     }
 
@@ -825,7 +849,7 @@ void *mm_realloc(void *ptr, size_t size)
     
     // 블록을 확장해야할 경우
     // 1. 왼쪽은 할당, 요청받은 블록이 힙 끝이면 그대로 확장만
-    if (prev_alloc && next_alloc && next_block_size == 0)
+    if ((prev_alloc || is_prev_exclusive) && next_alloc && next_block_size == 0)
     {
         // mem_sbrk는 확장하기 전 힙의 끝 주소를 반환한다.
         // 필요한 payload만큼 요청
@@ -837,7 +861,7 @@ void *mm_realloc(void *ptr, size_t size)
     }
 
     // 2. 왼쪽 병합했는데 공간이 부족, 그런데 힙의 끝이어서 제자리 확장이 가능한 경우
-    if (!prev_alloc && (old_size + prev_block_size < asize) && 
+    if (!prev_alloc && !is_prev_exclusive && (old_size + prev_block_size < asize) && 
         next_alloc && next_block_size == 0)
     {
         // mem_sbrk는 확장하기 전 힙의 끝 주소를 반환한다.
@@ -853,7 +877,9 @@ void *mm_realloc(void *ptr, size_t size)
     }
 
     // 3. 제자리, 오른쪽 블록 병합 해도 부족한데, 힙 끝인 경우 확장
-    if (prev_alloc && !next_alloc && old_size + next_block_size < asize && GET_SIZE(HDRP(NEXT_BLKP(NEXT_BLKP(oldptr)))) == 0)
+    if ((prev_alloc || is_prev_exclusive) && 
+        (!next_alloc || !is_next_exclusive) && 
+        old_size + next_block_size < asize && GET_SIZE(HDRP(NEXT_BLKP(NEXT_BLKP(oldptr)))) == 0)
     {
         // mem_sbrk는 확장하기 전 힙의 끝 주소를 반환한다.
         // 필요한 payload만큼 요청
