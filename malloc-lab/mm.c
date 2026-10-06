@@ -221,9 +221,9 @@ static void debug_place(size_t block_size, size_t asize)
 
 typedef struct arena
 {
-    char * unsorted_bin;                    // tcache
-    char * small_bin[SMALL_BIN_LENGTH];     // 24 ~ 1024
-    char * large_bin[LARGE_BIN_LENGTH];     // 1024 ~ 10240 이상
+    char *unsorted_bin;                    // tcache
+    char *small_bin[SMALL_BIN_LENGTH];     // 24 ~ 1024
+    char *large_bin[LARGE_BIN_LENGTH];     // 1024 ~ 10240 이상
 } Arena;
 
 static Arena arena;                   // NULL
@@ -596,6 +596,10 @@ static void *find_fit(size_t asize)
             }
             arena.small_bin[s_i] = new_head;
             return p;
+        }
+        else
+        {
+
         }
     }
     // large bin에서 찾기
