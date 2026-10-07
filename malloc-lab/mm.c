@@ -71,7 +71,7 @@ static char *heap_listp = 0;        // allocator가 관리하는 첫 블록을 �
 #define SMALL_BIN_LENGTH    129
 #define SMALL_BIN_UNIT      8
 
-#define LARGE_BIN_UNIT(i)   ((128ULL) * (1ULL << (i)))
+#define LARGE_BIN_UNIT      256
 #define LARGE_BIN_LENGTH    11
 
 #define NEXT_FREE_PTR(bp)   ((char *)(bp))              // 다음 빈 블록 주소의 위치
@@ -82,10 +82,12 @@ static char *heap_listp = 0;        // allocator가 관리하는 첫 블록을 �
 
 #define REMAIN              (3 * (DSIZE))
 
-#define EXCLUSIVE           10
+#define EXCLUSIVE           5
 #define EX_PACK(size, first, exclusive, alloc)    ((size) | ((first) << 2) | ((exclusive) << 1) | (alloc))  
 #define IS_EX(p)            ((GET(p) & 0x2) >> 1)
 #define IS_FIRST(p)         ((GET(p) & 0x4) >> 2)
+
+#define MAX_SMALL_BLOCK     5
 
 
 static void *extend_heap(size_t words);
@@ -100,6 +102,7 @@ static char **find_head(char *bp, size_t size);
 static void block_split(char *bp, size_t asize, size_t remain_size);
 static void write_end_of_heap_block(char *bp, size_t asize);
 static size_t find_in_small_bin(size_t asize);
+static size_t small_block_count(size_t asize);
 
 
 
@@ -403,15 +406,18 @@ static void classify_block(void * bp, size_t size)
     else
     {
         // large bin 범위에 해당하는지 검사
-        // large_bin[0] : 1024 ~ 2048
-        // large_bin[1] : 2048 ~ 3072
-        // large_bin[10] : 
-        size_t i = 1;
-        for (; i < LARGE_BIN_LENGTH; i++)
+        size_t limit = MAX_SMALL_BIN;
+        size_t width = LARGE_BIN_UNIT;
+        int i = 0;
+        for (; i < LARGE_BIN_LENGTH - 1; i++)
         {
-            if(size < 1024 + LARGE_BIN_UNIT(i))  break;
+            limit += width;
+
+            if (size < limit)
+                break;
+
+            width *= 2;
         }
-        i--;
         char *large_bin_head = arena.large_bin[i];
 
         // 헤드가 NULL
@@ -633,6 +639,13 @@ void mm_free(void *bp)
         cur = NEXT_BLKP(cur);
     }
 
+    // 전용 블록의 개수가 별로 없으면 합치지 말고 분류
+    if (small_block_count(small_size) < MAX_SMALL_BLOCK)
+    {
+        classify_block(bp, small_size);
+        return;
+    }
+
     // 한 영역이 전부 free 상태이므로 일반 블록으로 병합하고 분류한다.
     cur = first_ex;
     for (int i = 0; i < EXCLUSIVE; i++)
@@ -652,7 +665,9 @@ void mm_free(void *bp)
     PUT(HDRP(first_ex), EX_PACK(large_size, 0, 0, 0));   
     PUT(FTRP(first_ex), EX_PACK(large_size, 0, 0, 0));   
 
-    classify_block(first_ex, large_size);    
+    //classify_block(first_ex, large_size);
+    char *merged = coalesce(first_ex);
+    classify_block(merged, GET_SIZE(HDRP(merged)));
 }
 
 /*
@@ -681,15 +696,6 @@ void *mm_realloc(void *ptr, size_t size)
     copySize = GET_SIZE(HDRP(oldptr)) - DSIZE;
     if (size < copySize)    copySize = size;    // 복사량을 기존 payload에 맞춘다.
 
-    // 요청한 크기보다 이미 가지고 있는 크기가 더 크면 분할 후 리턴
-    if (old_size >= asize)
-    {
-        place(ptr, asize);  // 전용 영역인경우 옮기는 최적화 필요
-        return ptr;
-    }
-
-    // 블록을 병합해야할 경우
-
     size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(ptr))); // 이전 빈 블록 할당 플래그
     size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(ptr))); // 다음 빈 블록 할당 플래그
 
@@ -700,6 +706,33 @@ void *mm_realloc(void *ptr, size_t size)
     size_t prev_block_size = GET_SIZE(HDRP(PREV_BLKP(ptr)));
     size_t next_block_size = GET_SIZE(HDRP(NEXT_BLKP(ptr)));
 
+    // 요청한 크기보다 이미 가지고 있는 크기가 더 크면 분할 후 리턴
+    if (old_size >= asize)
+    {
+        // 전용 영역인 경우 크기에 맞는 전용 영역 찾기
+        if (IS_EX(HDRP(oldptr)))
+        {
+            // asize 이상 크기의 free block을 찾고 할당
+            if ((newptr = find_fit(asize)) != NULL)
+            {
+                place(newptr, asize);
+
+                return newptr;
+            }
+            // free block을 못찾았을 때 힙을 늘림
+            size_t extendsize = asize;
+            if ((newptr = extend_heap(extendsize / WSIZE)) == NULL) return NULL;
+
+            place(newptr, asize);
+            return newptr;
+        }
+
+        // 일반영역인경우 분할 후 리턴
+        place(oldptr, asize);  
+        return oldptr;
+    }
+
+    // 블록을 병합해야할 경우
     if (!is_exclusive)  // 현재블록이 전용블록이 아니어야함.
     {
         if (prev_alloc && next_alloc)
@@ -863,6 +896,7 @@ void *mm_realloc(void *ptr, size_t size)
     return newptr;
 }
 
+// 힙의 끝일때 현재 블록과 에필로그 블록의 헤더,푸터를 작성
 static void write_end_of_heap_block(char *bp, size_t asize)
 {
     PUT(HDRP(bp), PACK(asize, 1));            // 블록의 헤더 작성
@@ -870,6 +904,7 @@ static void write_end_of_heap_block(char *bp, size_t asize)
     PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1));     // epilogue 주소 헤더 작성
 }
 
+// 블록을 분할한다.
 static void block_split(char *bp, size_t asize, size_t remain_size)
 {
     // 사용할 블록
@@ -881,6 +916,7 @@ static void block_split(char *bp, size_t asize, size_t remain_size)
     PUT(FTRP(NEXT_BLKP(bp)), PACK(remain_size, 0));
 }
 
+// small bin에서 같은 크기 블록이 몇개 있는지 찾음
 static size_t find_in_small_bin(size_t asize)
 {
     // small bin에서 찾기
@@ -898,5 +934,24 @@ static size_t find_in_small_bin(size_t asize)
         count++;
         cur = GET_PTR(NEXT_FREE_PTR(cur));
     }
+    return count;
+}
+
+static size_t small_block_count(size_t asize)
+{
+    // small bin에서 블록 개수
+    size_t s_i = (size_t)(asize / SMALL_BIN_UNIT);
+
+    if (arena.small_bin[s_i] == NULL)   return 0;
+
+    size_t count = 0;
+    char *cur = arena.small_bin[s_i];
+
+    while (cur != NULL)
+    {
+        cur = GET_PTR(NEXT_FREE_PTR(cur));
+        count++;
+    }
+
     return count;
 }
