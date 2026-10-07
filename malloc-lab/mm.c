@@ -104,8 +104,6 @@ static void write_end_of_heap_block(char *bp, size_t asize);
 static size_t find_in_small_bin(size_t asize);
 static size_t small_block_count(size_t asize);
 
-
-
 typedef struct arena
 {
     char *unsorted_bin;                    // tcache
@@ -197,6 +195,7 @@ int mm_init(void)
  */
 static void *extend_heap(size_t words)
 {
+    //print_memory_stats();
     char *block_pointer;    // 새 free 블록의 첫 주소를 가리키는 포인터
     size_t size;            // 블록의 사이즈
 

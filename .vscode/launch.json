@@ -9,7 +9,7 @@
             "args": [
                 "-V",
                 "-f",
-                "traces/cccp-bal.rep",
+                "traces/binary2-bal.rep",
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/malloc-lab",
